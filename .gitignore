@@ -1,0 +1,11 @@
+# Python cache files anywhere in the project
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Django specific
+*.log
+db.sqlite3
+.env

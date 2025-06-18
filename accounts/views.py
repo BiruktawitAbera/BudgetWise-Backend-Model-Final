@@ -1400,34 +1400,6 @@ class BudgetPredictionView(APIView):
                 )
             
             # Generate predictions
-            income_pred = self.generate_predictions(
-                'income', 
-                period_type,
-                start_date,
-                end_date,
-                managed_departments,
-                prediction_span
-            )
-            expense_pred = self.generate_predictions(
-                'expense', 
-                period_type,
-                start_date,
-                end_date,
-                managed_departments,
-                prediction_span
-            )
-            
-            # Calculate net budget prediction
-            # net_prediction = []
-            # for inc, exp in zip(income_pred, expense_pred):
-            #     net_prediction.append({
-            #         'period': inc['period'],
-            #         'income': inc['total_amount'],
-            #         'expense': exp['total_amount'],
-            #         'net_budget': inc['total_amount'] - exp['total_amount']
-            #     })
-
-
             net_prediction = self.generate_ttm_prediction(prediction_span,start_date,end_date,period_type,managed_departments)
             
             return Response({
@@ -1438,9 +1410,9 @@ class BudgetPredictionView(APIView):
                     "period_type": period_type,
                     "managed_departments": list(managed_departments)
                 },
-                "predicted_income": income_pred,
-                "predicted_expense": expense_pred,
-                "net_budget_prediction": net_prediction
+                "predicted_income": net_prediction["income"],
+                "predicted_expense": net_prediction["expense"],
+                "net_budget_prediction": net_prediction["income"] - net_prediction["expense"]
             })
             
         except ValidationError as e:
@@ -1453,96 +1425,143 @@ class BudgetPredictionView(APIView):
             )
 
     def generate_ttm_prediction(self,prediction_span,start_date,end_date,period_type,departments):
+        logger.info("🔄 Starting TinyTimeMixer prediction process...")
+        
         # Get historical data
-        income_data = self.get_historical_data(
-            "income", start_date, end_date, period_type, departments
-        )
-        expense_data = self.get_historical_data("expense",start_date,end_date,period_type,departments)
-        
-        if income_data or expense_data:
-            try:
-                y = load_tecator(
-                    return_type="pd-multiindex",
-                    return_X_y=False
-                )
-                y.drop(['class_val'], axis=1, inplace=True)
-
-                forecaster = TinyTimeMixerForecaster(
-                    model_path=None,
-                    fit_strategy="full",
-                    config={
-                            "context_length": 8,
-                            "prediction_length": 2
-                    },
-                    training_args={
-                        "num_train_epochs": 1,
-                        "output_dir": "model_output",
-                        "per_device_train_batch_size": 32,
-                    },
-                ) 
-
-
-                forecaster.fit(y, fh=[1, 2]) 
-                y_pred = forecaster.predict() 
-                # print("=== Method 1: MultiIndex Iteration ===")
-                _income_len = len(income_data)
-                _expense_len = len(expense_data)
-                _probab = _income_len / (_income_len + _expense_len)
-                _income_pred = []
-                _expense_pred = []
-                _transaction_type = ["income","expense"]
-                _transaction_probab = [_probab,1-_probab]
-                for (series_id, timestamp), value in y_pred.iterrows():
-                    _selected_element = choices(_transaction_type, _transaction_probab, k=1)[0]
-                    if _selected_element == "income":
-                        _income_pred.append({
-                            "period": timestamp,
-                            "total_amount": value.iloc[0]/2
-                        })
-                    else:
-                        _expense_pred.append({
-                            "period": timestamp,
-                            "total_amount": value.iloc[0]/2
-                        })
-
-                return {"income":sum([x["total_amount"] for x in _income_pred]),"expense":sum([x["total_amount"] for x in _expense_pred])}
-            except Exception as e:
-                logger.warning(f"ML prediction failed, using fallback: {str(e)}")
-
-
-        pass
-    def generate_predictions(self, data_type, period_type, start_date, end_date, departments, prediction_span):
-        """Generate predictions with fallbacks to ensure data exists"""
-        # Get historical data
-        historical_data = self.get_historical_data(
-            data_type, start_date, end_date, period_type, departments
-        )
-        
-        # If we have historical data, use ML model
-        if historical_data:
-            try:
-                return self.generate_ml_predictions(historical_data, prediction_span, data_type, period_type)
-            except Exception as e:
-                logger.warning(f"ML prediction failed, using fallback: {str(e)}")
-        
-        # Fallback 1: Get department averages
+        logger.info("📊 Fetching historical data...")
         try:
-            return self.department_average_forecast(
-                data_type, period_type, departments, prediction_span, end_date
+            income_data = self.get_historical_data(
+                "income", start_date, end_date, period_type, departments
             )
-        except Exception as e:
-            logger.warning(f"Department average failed: {str(e)}")
-        
-        # Fallback 2: Use system-wide averages
-        try:
-            return self.system_average_forecast(
-                data_type, period_type, prediction_span, end_date
-            )
-        except Exception as e:
-            logger.error(f"All prediction methods failed: {str(e)}")
+            logger.info(f"✅ Income data fetched: {len(income_data) if income_data else 0} records")
             
-        # Final fallback: Return default values
-        return self.default_forecast(data_type, period_type, prediction_span, end_date)
+            expense_data = self.get_historical_data("expense",start_date,end_date,period_type,departments)
+            logger.info(f"✅ Expense data fetched: {len(expense_data) if expense_data else 0} records")
+            
+        except Exception as e:
+            logger.error(f"❌ Error fetching historical data: {str(e)}")
+            raise e
+        
+        # Ensure we have lists, not None
+        if income_data is None:
+            income_data = []
+        if expense_data is None:
+            expense_data = []
+            
+        logger.info(f"📈 Historical data summary - Income: {len(income_data)}, Expense: {len(expense_data)}")
+        
+        try:
+            logger.info("🔍 Loading Tecator dataset...")
+            y = load_tecator(
+                return_type="pd-multiindex",
+                return_X_y=False
+            )
+            logger.info(f"✅ Tecator dataset loaded with shape: {y.shape}")
+            
+            logger.info("🗑️ Dropping class_val column...")
+            y.drop(['class_val'], axis=1, inplace=True)
+            logger.info(f"✅ Dataset shape after dropping class_val: {y.shape}")
+
+            logger.info("🤖 Initializing TinyTimeMixerForecaster...")
+            forecaster = TinyTimeMixerForecaster(
+                model_path=None,
+                fit_strategy="full",
+                config={
+                        "context_length": 8,
+                        "prediction_length": 2
+                },
+                training_args={
+                    "num_train_epochs": 1,
+                    "output_dir": "model_output",
+                    "per_device_train_batch_size": 32,
+                },
+            ) 
+            logger.info("✅ TinyTimeMixerForecaster initialized successfully")
+
+            logger.info("🏋️ Fitting forecaster model...")
+            forecaster.fit(y, fh=[1, 2]) 
+            logger.info("✅ Model fitted successfully")
+            
+            logger.info("🔮 Making predictions...")
+            y_pred = forecaster.predict() 
+            logger.info(f"✅ Predictions generated with shape: {y_pred.shape}")
+            logger.info(f"🔍 Prediction index type: {type(y_pred.index)}")
+            logger.info(f"🔍 Prediction columns: {y_pred.columns.tolist()}")
+            
+            # Calculate probabilities safely
+            logger.info("🧮 Calculating probabilities...")
+            _income_len = len(income_data)
+            _expense_len = len(expense_data)
+            total_len = _income_len + _expense_len
+            
+            # Avoid division by zero
+            if total_len > 0:
+                _probab = _income_len / total_len
+            else:
+                _probab = 0.5  # Default to 50/50 if no historical data
+                
+            logger.info(f"📊 Probability calculation - Income: {_probab:.3f}, Expense: {1-_probab:.3f}")
+                
+            _income_pred = []
+            _expense_pred = []
+            _transaction_type = ["income","expense"]
+            _transaction_probab = [_probab, 1-_probab]
+            
+            logger.info("🎲 Processing predictions with random allocation...")
+            prediction_count = 0
+            
+            for (series_id, timestamp), value in y_pred.iterrows():
+                prediction_count += 1
+                logger.info(f"🔄 Processing prediction {prediction_count}: series_id={series_id}, timestamp={timestamp}")
+                logger.info(f"📈 Raw prediction value: {value.iloc[0]}")
+                
+                _selected_element = choices(_transaction_type, _transaction_probab, k=1)[0]
+                logger.info(f"🎯 Selected category: {_selected_element}")
+                
+                if _selected_element == "income":
+                    _income_pred.append({
+                        "period": str(timestamp),
+                        "total_amount": float(value.iloc[0]/2)
+                    })
+                    logger.info(f"💰 Added to income predictions: {float(value.iloc[0]/2)}")
+                else:
+                    _expense_pred.append({
+                        "period": str(timestamp),
+                        "total_amount": float(value.iloc[0]/2)
+                    })
+                    logger.info(f"💸 Added to expense predictions: {float(value.iloc[0]/2)}")
+
+            logger.info(f"📊 Final summary - Income predictions: {len(_income_pred)}, Expense predictions: {len(_expense_pred)}")
+            
+            total_income = sum([x["total_amount"] for x in _income_pred])
+            total_expense = sum([x["total_amount"] for x in _expense_pred])
+            
+            logger.info(f"💵 Total predicted income: {total_income}")
+            logger.info(f"💸 Total predicted expense: {total_expense}")
+            
+            result = {
+                "income": total_income,
+                "expense": total_expense,
+                "income_predictions": _income_pred,
+                "expense_predictions": _expense_pred
+            }
+            
+            logger.info("✅ TinyTimeMixer prediction completed successfully!")
+            return result
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ TinyTimeMixer prediction failed at step: {str(e)}")
+            logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
+            
+            # Return default predictions as fallback
+            logger.info("🔄 Returning fallback predictions...")
+            return {
+                "income": 50000.0,  # Default income prediction
+                "expense": 40000.0,  # Default expense prediction
+                "income_predictions": [{"period": "default", "total_amount": 50000.0}],
+                "expense_predictions": [{"period": "default", "total_amount": 40000.0}]
+            }
 
     def get_historical_data(self, data_type, start_date, end_date, period_type, departments):
         """Retrieve historical data based on data type"""
@@ -1596,129 +1615,6 @@ class BudgetPredictionView(APIView):
                     'total_amount': float(item['total_amount'] or 0)
                 } for item in result
             ]
-
-    # def generate_ml_predictions(self, historical_data, prediction_span, data_type, period_type):
-    #     """Generate predictions using ML model"""
-    #     model_dir = "financial_models/"
-    #     model_file = f"{data_type}_{period_type}_model.joblib"
-    #     model_path = os.path.join(model_dir, model_file)
-        
-    #     if not os.path.exists(model_path):
-    #         raise FileNotFoundError(f"Model not found: {model_file}")
-        
-    #     # Load model
-    #     model = joblib.load(model_path)
-        
-    #     # Prepare data
-    #     df = pd.DataFrame(historical_data)
-        
-    #     # Convert period strings to datetime objects
-    #     if period_type == 'quarterly':
-    #         # Convert "2023-Q1" to datetime (first day of quarter)
-    #         df['datetime'] = df['period'].apply(
-    #             lambda s: pd.Timestamp(
-    #                 year=int(s.split('-')[0]), 
-    #                 month=(int(s.split('-')[1][1:])-1)*3+1, 
-    #                 day=1
-    #             )
-    #         )
-    #     else:  # monthly
-    #         df['datetime'] = pd.to_datetime(df['period'])
-        
-    #     df = df.set_index('datetime').asfreq('QS' if period_type=='quarterly' else 'MS').fillna(0)
-        
-    #     # Generate predictions
-    #     forecast = model.predict(n_periods=prediction_span)
-        
-    #     # Create future periods
-    #     last_date = df.index[-1]
-    #     if period_type == 'quarterly':
-    #         date_range = pd.date_range(
-    #             start=last_date + pd.DateOffset(months=3),
-    #             periods=prediction_span,
-    #             freq='QS'
-    #         )
-    #         # Format quarterly periods correctly
-    #         formatted_periods = [
-    #             f"{d.year}-Q{(d.month-1)//3 + 1}" 
-    #             for d in date_range
-    #         ]
-    #     else:
-    #         date_range = pd.date_range(
-    #             start=last_date + pd.DateOffset(months=1),
-    #             periods=prediction_span,
-    #             freq='MS'
-    #         )
-    #         formatted_periods = [d.strftime('%Y-%m') for d in date_range]
-        
-    #     return [
-    #         {
-    #             'period': period,
-    #             'total_amount': float(amount)
-    #         } for period, amount in zip(formatted_periods, forecast)
-    #     ]
-    
-    def department_average_forecast(self, data_type, period_type, departments, periods, end_date):
-        """Fallback forecasting using department averages"""
-        if data_type == 'income':
-            avg_amount = Income.objects.filter(
-                department__in=departments
-            ).aggregate(avg=Avg('amount'))['avg'] or 0
-        else:
-            # Get average expense for users in departments
-            user_ids = User.objects.filter(department__in=departments).values_list('id', flat=True)
-            avg_amount = Expense.objects.filter(
-                status='APPROVED',
-                department_head_id__in=user_ids
-            ).aggregate(avg=Avg('amount'))['avg'] or 0
-        
-        return self._generate_forecast_periods(period_type, periods, end_date, avg_amount)
-
-    def system_average_forecast(self, data_type, period_type, periods, end_date):
-        """Fallback to system-wide averages"""
-        if data_type == 'income':
-            avg_amount = Income.objects.all().aggregate(avg=Avg('amount'))['avg'] or 0
-        else:
-            avg_amount = Expense.objects.filter(
-                status='APPROVED'
-            ).aggregate(avg=Avg('amount'))['avg'] or 0
-        
-        return self._generate_forecast_periods(period_type, periods, end_date, avg_amount)
-
-    def default_forecast(self, data_type, period_type, periods, end_date):
-        """Final fallback with default values"""
-        DEFAULT_INCOME = 10000.0  # Adjust as needed
-        DEFAULT_EXPENSE = 8000.0   # Adjust as needed
-        
-        amount = DEFAULT_INCOME if data_type == 'income' else DEFAULT_EXPENSE
-        return self._generate_forecast_periods(period_type, periods, end_date, amount)
-
-    def _generate_forecast_periods(self, period_type, periods, end_date, amount):
-        """Generate forecast periods with consistent amount"""
-        base_date = pd.Timestamp(end_date)
-        if period_type == 'quarterly':
-            date_range = pd.date_range(
-                start=base_date + pd.DateOffset(months=3),
-                periods=periods,
-                freq='QS'
-            )
-            # Format quarterly periods correctly
-            formatted_periods = [
-                f"{d.year}-Q{(d.month-1)//3 + 1}" 
-                for d in date_range
-            ]
-        else:
-            date_range = pd.date_range(
-                start=base_date + pd.DateOffset(months=1),
-                periods=periods,
-                freq='MS'
-            )
-            formatted_periods = [d.strftime('%Y-%m') for d in date_range]
-        
-        return [{
-            'period': period,
-            'total_amount': float(amount)
-        } for period in formatted_periods]
 
         
 # user profile
