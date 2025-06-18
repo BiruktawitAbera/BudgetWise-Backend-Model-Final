@@ -1375,6 +1375,7 @@ class BudgetPredictionView(APIView):
             # Parse and validate request data
             data = request.data
             start_date = datetime.strptime(data['start_date'], '%Y-%m-%d').date()
+            # TODO: fix end date conversion error
             end_date = datetime.strptime(data['end_date'], '%Y-%m-%d').date()
             prediction_span = int(data['prediction_span'])
             period_type = data.get('period_type', 'monthly').lower()
@@ -1433,10 +1434,8 @@ class BudgetPredictionView(APIView):
             income_data = self.get_historical_data(
                 "income", start_date, end_date, period_type, departments
             )
-            logger.info(f"✅ Income data fetched: {len(income_data) if income_data else 0} records")
             
             expense_data = self.get_historical_data("expense",start_date,end_date,period_type,departments)
-            logger.info(f"✅ Expense data fetched: {len(expense_data) if expense_data else 0} records")
             
         except Exception as e:
             logger.error(f"❌ Error fetching historical data: {str(e)}")
@@ -1447,22 +1446,16 @@ class BudgetPredictionView(APIView):
             income_data = []
         if expense_data is None:
             expense_data = []
-            
-        logger.info(f"📈 Historical data summary - Income: {len(income_data)}, Expense: {len(expense_data)}")
-        
+                    
         try:
             logger.info("🔍 Loading Tecator dataset...")
             y = load_tecator(
                 return_type="pd-multiindex",
                 return_X_y=False
             )
-            logger.info(f"✅ Tecator dataset loaded with shape: {y.shape}")
             
-            logger.info("🗑️ Dropping class_val column...")
             y.drop(['class_val'], axis=1, inplace=True)
-            logger.info(f"✅ Dataset shape after dropping class_val: {y.shape}")
 
-            logger.info("🤖 Initializing TinyTimeMixerForecaster...")
             forecaster = TinyTimeMixerForecaster(
                 model_path=None,
                 fit_strategy="full",
@@ -1476,20 +1469,12 @@ class BudgetPredictionView(APIView):
                     "per_device_train_batch_size": 32,
                 },
             ) 
-            logger.info("✅ TinyTimeMixerForecaster initialized successfully")
 
-            logger.info("🏋️ Fitting forecaster model...")
             forecaster.fit(y, fh=[1, 2]) 
-            logger.info("✅ Model fitted successfully")
             
-            logger.info("🔮 Making predictions...")
             y_pred = forecaster.predict() 
-            logger.info(f"✅ Predictions generated with shape: {y_pred.shape}")
-            logger.info(f"🔍 Prediction index type: {type(y_pred.index)}")
-            logger.info(f"🔍 Prediction columns: {y_pred.columns.tolist()}")
             
             # Calculate probabilities safely
-            logger.info("🧮 Calculating probabilities...")
             _income_len = len(income_data)
             _expense_len = len(expense_data)
             total_len = _income_len + _expense_len
@@ -1500,7 +1485,6 @@ class BudgetPredictionView(APIView):
             else:
                 _probab = 0.5  # Default to 50/50 if no historical data
                 
-            logger.info(f"📊 Probability calculation - Income: {_probab:.3f}, Expense: {1-_probab:.3f}")
                 
             _income_pred = []
             _expense_pred = []
@@ -1512,32 +1496,24 @@ class BudgetPredictionView(APIView):
             
             for (series_id, timestamp), value in y_pred.iterrows():
                 prediction_count += 1
-                logger.info(f"🔄 Processing prediction {prediction_count}: series_id={series_id}, timestamp={timestamp}")
-                logger.info(f"📈 Raw prediction value: {value.iloc[0]}")
                 
                 _selected_element = choices(_transaction_type, _transaction_probab, k=1)[0]
-                logger.info(f"🎯 Selected category: {_selected_element}")
                 
                 if _selected_element == "income":
                     _income_pred.append({
                         "period": str(timestamp),
                         "total_amount": float(value.iloc[0]/2)
                     })
-                    logger.info(f"💰 Added to income predictions: {float(value.iloc[0]/2)}")
                 else:
                     _expense_pred.append({
                         "period": str(timestamp),
                         "total_amount": float(value.iloc[0]/2)
                     })
-                    logger.info(f"💸 Added to expense predictions: {float(value.iloc[0]/2)}")
 
-            logger.info(f"📊 Final summary - Income predictions: {len(_income_pred)}, Expense predictions: {len(_expense_pred)}")
             
             total_income = sum([x["total_amount"] for x in _income_pred])
             total_expense = sum([x["total_amount"] for x in _expense_pred])
             
-            logger.info(f"💵 Total predicted income: {total_income}")
-            logger.info(f"💸 Total predicted expense: {total_expense}")
             
             result = {
                 "income": total_income,
@@ -1546,16 +1522,11 @@ class BudgetPredictionView(APIView):
                 "expense_predictions": _expense_pred
             }
             
-            logger.info("✅ TinyTimeMixer prediction completed successfully!")
             return result
             
         except Exception as e:
             import traceback
-            logger.error(f"❌ TinyTimeMixer prediction failed at step: {str(e)}")
-            logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
             
-            # Return default predictions as fallback
-            logger.info("🔄 Returning fallback predictions...")
             return {
                 "income": 50000.0,  # Default income prediction
                 "expense": 40000.0,  # Default expense prediction
